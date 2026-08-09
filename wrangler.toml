@@ -1,0 +1,15 @@
+name = "knowtes-jarvis"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[ai]
+binding = "AI"
+
+[vars]
+# Set this to the deployed web/app origin when browser access is enabled.
+ALLOWED_ORIGIN = "*"
+
+# Set your Anthropic key via:
+#   npx wrangler secret put ANTHROPIC_API_KEY
+# Set the same random value used by Railway via:
+#   npx wrangler secret put JARVIS_TOKEN_SECRET
