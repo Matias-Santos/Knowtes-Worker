@@ -35,9 +35,10 @@ Only link when the relationship is clear and meaningful. Empty links array is fi
 Return ONLY the JSON object. No prose, no markdown fences, no explanation.`;
 }
 
-function corsHeaders(origin: string) {
+function corsHeaders(requestOrigin: string | null, allowedOrigin: string) {
+  const origin = requestOrigin && requestOrigin === allowedOrigin ? requestOrigin : "";
   return {
-  "Access-Control-Allow-Origin": origin,
+  ...(origin ? { "Access-Control-Allow-Origin": origin } : {}),
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
   "Vary": "Origin",
@@ -67,7 +68,7 @@ function base64UrlToBytes(value: string): Uint8Array {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-async function verifyJarvisToken(request: Request, secret: string): Promise<boolean> {
+export async function verifyJarvisToken(request: Request, secret: string): Promise<boolean> {
   const value = request.headers.get("Authorization");
   if (!value?.startsWith("Bearer ") || !secret) return false;
   const parts = value.slice(7).split(".");
@@ -81,9 +82,11 @@ async function verifyJarvisToken(request: Request, secret: string): Promise<bool
     );
     if (!validSignature) return false;
     const claims = JSON.parse(new TextDecoder().decode(base64UrlToBytes(parts[1]))) as JarvisClaims;
-    return claims.iss === "knowtes-backend" && claims.aud === "knowtes-jarvis"
+    const now = Math.floor(Date.now() / 1000);
+    return typeof claims.sub === "string" && claims.sub.length > 0
+      && claims.iss === "knowtes-backend" && claims.aud === "knowtes-jarvis"
       && claims.scope === "jarvis:voice" && ["pro", "premium", "admin"].includes(claims.plan)
-      && claims.exp > Math.floor(Date.now() / 1000);
+      && claims.exp > now && claims.exp <= now + 10 * 60;
   } catch {
     return false;
   }
@@ -91,9 +94,13 @@ async function verifyJarvisToken(request: Request, secret: string): Promise<bool
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const allowedOrigin = env.ALLOWED_ORIGIN || "*";
-    const headers = corsHeaders(allowedOrigin);
+    const allowedOrigin = env.ALLOWED_ORIGIN || "";
+    const requestOrigin = request.headers.get("Origin");
+    const headers = corsHeaders(requestOrigin, allowedOrigin);
     if (request.method === "OPTIONS") {
+      if (!allowedOrigin || requestOrigin !== allowedOrigin) {
+        return new Response(null, { status: 403 });
+      }
       return new Response(null, { status: 204, headers });
     }
 
@@ -106,7 +113,7 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
-      const ready = Boolean(env.JARVIS_TOKEN_SECRET && env.ANTHROPIC_API_KEY && env.AI);
+      const ready = Boolean(env.JARVIS_TOKEN_SECRET && env.ANTHROPIC_API_KEY && env.AI && env.ALLOWED_ORIGIN);
       return new Response(JSON.stringify({ status: ready ? "ok" : "misconfigured" }), {
         status: ready ? 200 : 503,
         headers: { ...headers, "Content-Type": "application/json", "Cache-Control": "no-store" },
@@ -137,8 +144,8 @@ function handleVoiceStream(request: Request, env: Env, cors: Record<string, stri
   };
 
   processVoice(request, env, send)
-    .catch(async (err: Error) => {
-      try { await send({ type: "error", message: err.message ?? "Internal error" }); } catch {}
+    .catch(async () => {
+      try { await send({ type: "error", message: "Voice processing failed. Please try again." }); } catch {}
     })
     .finally(async () => {
       try { await writer.close(); } catch {}
@@ -163,6 +170,10 @@ async function processVoice(
   const audioFile = formData.get("audio") as File | null;
   if (!audioFile) throw new Error("No audio file in request");
   if (audioFile.size > 25 * 1024 * 1024) throw new Error("Audio file exceeds the 25 MB limit");
+  const allowedAudioTypes = new Set([
+    "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/aac",
+  ]);
+  if (audioFile.type && !allowedAudioTypes.has(audioFile.type)) throw new Error("Unsupported audio type");
 
   // Parse existing knowtes sent by the app for context
   const knowtesRaw = formData.get("knowtes") as string | null;
@@ -199,12 +210,14 @@ async function processVoice(
   // Validate and filter links to only IDs present in the sent knowtes
   const validIds = new Set(existingKnowtes.map((k) => k.id));
   const rawLinks = Array.isArray(parsed.links) ? parsed.links : [];
+  const linkTypes = new Set(["supports", "contradicts", "causes", "evolves_to", "related"]);
   const links = rawLinks
     .filter(
       (l): l is { to: string; type: string } =>
         typeof l === "object" && l !== null &&
         typeof (l as Record<string, unknown>).to === "string" &&
         typeof (l as Record<string, unknown>).type === "string" &&
+        linkTypes.has((l as Record<string, unknown>).type as string) &&
         (existingKnowtes.length === 0 || validIds.has((l as Record<string, unknown>).to as string)),
     )
     .slice(0, 10);
@@ -212,12 +225,12 @@ async function processVoice(
   await send({
     type: "result",
     knowte: {
-      title:      String(parsed.title ?? ""),
-      tl_dr:      String(parsed.tl_dr ?? ""),
-      content:    String(parsed.content ?? ""),
-      insight:    String(parsed.insight ?? ""),
-      confidence: Number(parsed.confidence ?? 0.7),
-      reasoning:  String(parsed.reasoning ?? ""),
+      title:      String(parsed.title ?? "").slice(0, 120),
+      tl_dr:      String(parsed.tl_dr ?? "").slice(0, 1000),
+      content:    String(parsed.content ?? "").slice(0, 50_000),
+      insight:    String(parsed.insight ?? "").slice(0, 5000),
+      confidence: Math.min(1, Math.max(0, Number(parsed.confidence ?? 0.7) || 0.7)),
+      reasoning:  String(parsed.reasoning ?? "").slice(0, 2000),
       source:     "claude-sonnet-4-6",
       links,
     },
@@ -244,11 +257,12 @@ async function streamClaude(
       system: systemPrompt,
       messages: [{ role: "user", content: userText }],
     }),
+    signal: AbortSignal.timeout(45_000),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`Claude API failed (${res.status}): ${body.slice(0, 200)}`);
+    throw new Error(`Claude API failed (${res.status})`);
   }
 
   const reader = res.body!.getReader();
