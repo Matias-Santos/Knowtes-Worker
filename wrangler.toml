@@ -7,7 +7,7 @@ binding = "AI"
 
 [vars]
 # Set this to the deployed web/app origin when browser access is enabled.
-ALLOWED_ORIGIN = "https://example.com"
+ALLOWED_ORIGIN = "https://www.knowtes.lat"
 
 # Set your Anthropic key via:
 #   npx wrangler secret put ANTHROPIC_API_KEY
