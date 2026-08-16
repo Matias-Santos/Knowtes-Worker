@@ -1,4 +1,5 @@
 type KnowteSummary = { id: string; title: string; tl_dr: string };
+const JARVIS_VERSION = "typed-links-v2";
 
 function buildSystemPrompt(existingKnowtes: KnowteSummary[]): string {
   const knowteContext = existingKnowtes.length > 0
@@ -110,7 +111,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify({ status: "Knowtes Jarvis Worker is running" }), {
+      return new Response(JSON.stringify({ status: "Knowtes Jarvis Worker is running", version: JARVIS_VERSION }), {
         headers: { ...headers, "Content-Type": "application/json" },
       });
     }
