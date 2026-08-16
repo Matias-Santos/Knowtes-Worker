@@ -9,7 +9,9 @@ function buildSystemPrompt(existingKnowtes: KnowteSummary[]): string {
       }`
     : "";
 
-  return `You are Jarvis, an AI that converts voice notes into structured Knowtes.${knowteContext}
+  return `You are Jarvis, an AI that converts voice notes into useful, faithful structured Knowtes.${knowteContext}
+
+Preserve the speaker's intent, language, names, numbers, decisions, and uncertainty. Do not invent facts. Remove filler and repetition, but keep concrete details. Use short headings and lists in content when they improve clarity.
 
 Given a voice-transcribed input, produce a single JSON object:
 {
@@ -20,18 +22,19 @@ Given a voice-transcribed input, produce a single JSON object:
   "confidence": 0.85,
   "reasoning": "Why you assigned this confidence score (1-2 sentences)",
   "links": [
-    { "to": "<exact-knowte-id>", "type": "supports|contradicts|causes|evolves_to|related" }
+    { "to": "<exact-knowte-id>", "type": "supports|contradicts|causes|evolves_to|related", "status": "resolved|pending" }
   ]
 }
 
 Link type guide:
-- supports: this knowte provides evidence for the target
-- contradicts: this knowte challenges or opposes the target
-- causes: this knowte describes a cause or precursor of the target
-- evolves_to: this knowte is a refinement or update of the target
+- supports: the NEW knowte provides evidence or reasoning that strengthens the target
+- contradicts: the NEW knowte conflicts with or challenges a claim in the target
+- causes: the NEW knowte describes a cause that leads to the target
+- evolves_to: the TARGET is a later version, refinement, or next step of the new knowte
 - related: general conceptual connection
 
-Only link when the relationship is clear and meaningful. Empty links array is fine.
+Use "resolved" only when the target and relationship type are explicit and high-confidence; otherwise use "pending". Prefer related over a directional type when direction is unclear. Never link solely because two Knowtes share a broad topic. Do not emit duplicate targets. Empty links array is better than a weak connection.
+The title and summary must stand alone. Content should be a polished, accurate version of the recording, not generic advice. Insight should add one genuinely useful implication or next action grounded in the recording.
 Return ONLY the JSON object. No prose, no markdown fences, no explanation.`;
 }
 
@@ -211,15 +214,26 @@ async function processVoice(
   const validIds = new Set(existingKnowtes.map((k) => k.id));
   const rawLinks = Array.isArray(parsed.links) ? parsed.links : [];
   const linkTypes = new Set(["supports", "contradicts", "causes", "evolves_to", "related"]);
+  const seenTargets = new Set<string>();
   const links = rawLinks
     .filter(
-      (l): l is { to: string; type: string } =>
+      (l): l is { to: string; type: string; status?: string } =>
         typeof l === "object" && l !== null &&
         typeof (l as Record<string, unknown>).to === "string" &&
         typeof (l as Record<string, unknown>).type === "string" &&
         linkTypes.has((l as Record<string, unknown>).type as string) &&
         (existingKnowtes.length === 0 || validIds.has((l as Record<string, unknown>).to as string)),
     )
+    .filter((link) => {
+      if (seenTargets.has(link.to)) return false;
+      seenTargets.add(link.to);
+      return true;
+    })
+    .map((link) => ({
+      to: link.to,
+      type: link.type,
+      status: link.status === "resolved" ? "resolved" : "pending",
+    }))
     .slice(0, 10);
 
   await send({
@@ -252,7 +266,7 @@ async function streamClaude(
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: 1024,
+      max_tokens: 2048,
       stream: true,
       system: systemPrompt,
       messages: [{ role: "user", content: userText }],

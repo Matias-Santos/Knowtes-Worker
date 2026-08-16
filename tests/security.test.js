@@ -20,6 +20,13 @@ test("worker bounds untrusted input and upstream execution", () => {
   assert.doesNotMatch(source, /body\.slice\(0, 200\)/);
 });
 
+test("worker validates typed links and preserves review status", () => {
+  assert.match(source, /supports\|contradicts\|causes\|evolves_to\|related/);
+  assert.match(source, /status: link\.status === "resolved" \? "resolved" : "pending"/);
+  assert.match(source, /seenTargets\.has\(link\.to\)/);
+  assert.match(source, /max_tokens: 2048/);
+});
+
 test("worker does not allow wildcard browser origins", () => {
   const config = fs.readFileSync(path.resolve(__dirname, "../wrangler.toml"), "utf8");
   assert.doesNotMatch(config, /ALLOWED_ORIGIN\s*=\s*"\*"/);
