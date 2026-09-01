@@ -1,7 +1,10 @@
 type KnowteSummary = { id: string; title: string; tl_dr: string };
-const JARVIS_VERSION = "typed-links-v2";
+type KnowteDraft = { title: string; tl_dr: string; content: string };
+type JarvisScope = "jarvis:voice" | "jarvis:text";
+const MAX_CONTEXT_KNOWTES = 5;
+const JARVIS_VERSION = "santos-text-v3";
 
-function buildSystemPrompt(existingKnowtes: KnowteSummary[]): string {
+function buildSystemPrompt(existingKnowtes: KnowteSummary[], mode: "voice" | "improve"): string {
   const knowteContext = existingKnowtes.length > 0
     ? `\n\nEXISTING KNOWTES — identify relationships using exact IDs:\n${
         existingKnowtes
@@ -10,11 +13,16 @@ function buildSystemPrompt(existingKnowtes: KnowteSummary[]): string {
       }`
     : "";
 
-  return `You are Jarvis, an AI that converts voice notes into useful, faithful structured Knowtes.${knowteContext}
+  const task = mode === "voice"
+    ? "Convert the voice-transcribed input into a useful, faithful structured Knowte."
+    : `Improve the existing Knowte without changing its meaning or inventing facts.
+Preserve useful detail, make the writing clearer and more actionable, and return a complete revised Knowte.`;
 
-Preserve the speaker's intent, language, names, numbers, decisions, and uncertainty. Do not invent facts. Remove filler and repetition, but keep concrete details. Use short headings and lists in content when they improve clarity.
+  return `You are Santos, the AI thinking partner inside Knowtes. ${task}${knowteContext}
 
-Given a voice-transcribed input, produce a single JSON object:
+Preserve the user's intent, language, names, numbers, decisions, and uncertainty. Do not invent facts. Remove filler and repetition, but keep concrete details. Use short headings and lists in content when they improve clarity.
+
+Produce a single JSON object:
 {
   "title": "A concise, specific title (max 60 chars)",
   "tl_dr": "One sentence summary of the core idea",
@@ -72,7 +80,7 @@ function base64UrlToBytes(value: string): Uint8Array {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
-export async function verifyJarvisToken(request: Request, secret: string): Promise<boolean> {
+export async function verifyJarvisToken(request: Request, secret: string, scope: JarvisScope): Promise<boolean> {
   const value = request.headers.get("Authorization");
   if (!value?.startsWith("Bearer ") || !secret) return false;
   const parts = value.slice(7).split(".");
@@ -89,7 +97,7 @@ export async function verifyJarvisToken(request: Request, secret: string): Promi
     const now = Math.floor(Date.now() / 1000);
     return typeof claims.sub === "string" && claims.sub.length > 0
       && claims.iss === "knowtes-backend" && claims.aud === "knowtes-jarvis"
-      && claims.scope === "jarvis:voice" && ["pro", "premium", "admin"].includes(claims.plan)
+      && claims.scope === scope && ["pro", "premium", "admin"].includes(claims.plan)
       && claims.exp > now && claims.exp <= now + 10 * 60;
   } catch {
     return false;
@@ -125,7 +133,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/voice/stream") {
-      if (!(await verifyJarvisToken(request, env.JARVIS_TOKEN_SECRET))) {
+      if (!(await verifyJarvisToken(request, env.JARVIS_TOKEN_SECRET, "jarvis:voice"))) {
         return new Response(JSON.stringify({ detail: "Knowtes Pro authorization required." }), {
           status: 403,
           headers: { ...headers, "Content-Type": "application/json" },
@@ -134,11 +142,33 @@ export default {
       return handleVoiceStream(request, env, headers);
     }
 
+    if (request.method === "POST" && url.pathname === "/text/stream") {
+      if (!(await verifyJarvisToken(request, env.JARVIS_TOKEN_SECRET, "jarvis:text"))) {
+        return new Response(JSON.stringify({ detail: "Knowtes AI authorization required." }), {
+          status: 403,
+          headers: { ...headers, "Content-Type": "application/json" },
+        });
+      }
+      return handleTextStream(request, env, headers);
+    }
+
     return new Response("Not Found", { status: 404, headers });
   },
 };
 
 function handleVoiceStream(request: Request, env: Env, cors: Record<string, string>): Response {
+  return handleEventStream(cors, (send) => processVoice(request, env, send), "Voice processing failed. Please try again.");
+}
+
+function handleTextStream(request: Request, env: Env, cors: Record<string, string>): Response {
+  return handleEventStream(cors, (send) => processText(request, env, send), "Santos could not improve this Knowte. Please try again.");
+}
+
+function handleEventStream(
+  cors: Record<string, string>,
+  process: (send: (event: object) => Promise<void>) => Promise<void>,
+  errorMessage: string,
+): Response {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -147,9 +177,9 @@ function handleVoiceStream(request: Request, env: Env, cors: Record<string, stri
     await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
   };
 
-  processVoice(request, env, send)
+  process(send)
     .catch(async () => {
-      try { await send({ type: "error", message: "Voice processing failed. Please try again." }); } catch {}
+      try { await send({ type: "error", message: errorMessage }); } catch {}
     })
     .finally(async () => {
       try { await writer.close(); } catch {}
@@ -184,7 +214,7 @@ async function processVoice(
   const existingKnowtes: KnowteSummary[] = [];
   if (knowtesRaw) {
     if (knowtesRaw.length > 250_000) throw new Error("Knowte context is too large");
-    try { existingKnowtes.push(...(JSON.parse(knowtesRaw) as KnowteSummary[]).slice(0, 500)); } catch {}
+    try { existingKnowtes.push(...sanitizeKnowteContext(JSON.parse(knowtesRaw))); } catch {}
   }
 
   // Transcribe using Cloudflare AI (built-in Whisper — no extra API key needed)
@@ -196,10 +226,55 @@ async function processVoice(
   await send({ type: "transcribed", text });
 
   // Generate with Claude (streaming), passing existing knowtes as context
-  const systemPrompt = buildSystemPrompt(existingKnowtes);
+  const systemPrompt = buildSystemPrompt(existingKnowtes, "voice");
   const accumulated = await streamClaude(text, env.ANTHROPIC_API_KEY, systemPrompt, async (delta) => {
     await send({ type: "token", delta });
   });
+
+  await send({ type: "result", knowte: parseKnowteResult(accumulated, existingKnowtes) });
+}
+
+async function processText(
+  request: Request,
+  env: Env,
+  send: (event: object) => Promise<void>,
+): Promise<void> {
+  const rawBody = await request.text();
+  if (rawBody.length > 75_000) throw new Error("Text request is too large");
+  const body = JSON.parse(rawBody) as { knowte?: Partial<KnowteDraft>; knowtes?: unknown };
+  const draft: KnowteDraft = {
+    title: typeof body.knowte?.title === "string" ? body.knowte.title.slice(0, 120) : "",
+    tl_dr: typeof body.knowte?.tl_dr === "string" ? body.knowte.tl_dr.slice(0, 1000) : "",
+    content: typeof body.knowte?.content === "string" ? body.knowte.content.slice(0, 50_000) : "",
+  };
+  if (!draft.title.trim() && !draft.tl_dr.trim() && !draft.content.trim()) {
+    throw new Error("Knowte text is empty");
+  }
+  const existingKnowtes = sanitizeKnowteContext(body.knowtes);
+  const userText = JSON.stringify(draft);
+  const systemPrompt = buildSystemPrompt(existingKnowtes, "improve");
+  const accumulated = await streamClaude(userText, env.ANTHROPIC_API_KEY, systemPrompt, async (delta) => {
+    await send({ type: "token", delta });
+  });
+
+  await send({ type: "result", knowte: parseKnowteResult(accumulated, existingKnowtes) });
+}
+
+function sanitizeKnowteContext(value: unknown): KnowteSummary[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_CONTEXT_KNOWTES).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const candidate = item as Record<string, unknown>;
+    if (typeof candidate.id !== "string" || !candidate.id) return [];
+    return [{
+      id: candidate.id.slice(0, 200),
+      title: typeof candidate.title === "string" ? candidate.title.slice(0, 120) : "",
+      tl_dr: typeof candidate.tl_dr === "string" ? candidate.tl_dr.slice(0, 1000) : "",
+    }];
+  });
+}
+
+function parseKnowteResult(accumulated: string, existingKnowtes: KnowteSummary[]) {
 
   const jsonMatch = accumulated.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("Claude did not return valid JSON");
@@ -235,11 +310,9 @@ async function processVoice(
       type: link.type,
       status: link.status === "resolved" ? "resolved" : "pending",
     }))
-    .slice(0, 10);
+    .slice(0, MAX_CONTEXT_KNOWTES);
 
-  await send({
-    type: "result",
-    knowte: {
+  return {
       title:      String(parsed.title ?? "").slice(0, 120),
       tl_dr:      String(parsed.tl_dr ?? "").slice(0, 1000),
       content:    String(parsed.content ?? "").slice(0, 50_000),
@@ -248,8 +321,7 @@ async function processVoice(
       reasoning:  String(parsed.reasoning ?? "").slice(0, 2000),
       source:     "claude-sonnet-4-6",
       links,
-    },
-  });
+  };
 }
 
 async function streamClaude(
