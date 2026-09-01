@@ -11,11 +11,15 @@ test("worker authorization validates signature and bounded entitlement claims", 
   assert.match(source, /claims\.aud === "knowtes-jarvis"/);
   assert.match(source, /claims\.exp <= now \+ 10 \* 60/);
   assert.match(source, /\["pro", "premium", "admin"\]\.includes\(claims\.plan\)/);
+  assert.match(source, /claims\.scope === scope/);
+  assert.match(source, /"jarvis:text"/);
 });
 
 test("worker bounds untrusted input and upstream execution", () => {
   assert.match(source, /audioFile\.size > 25 \* 1024 \* 1024/);
   assert.match(source, /knowtesRaw\.length > 250_000/);
+  assert.match(source, /rawBody\.length > 75_000/);
+  assert.match(source, /slice\(0, MAX_CONTEXT_KNOWTES\)/);
   assert.match(source, /AbortSignal\.timeout\(45_000\)/);
   assert.doesNotMatch(source, /body\.slice\(0, 200\)/);
 });
